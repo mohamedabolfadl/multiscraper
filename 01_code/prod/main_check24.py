@@ -8,9 +8,30 @@ from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
-import webcrawler
 
+####################################
+#--      CLASS DEFINITIONS       --#
+####################################
 
+#-- Webcrawler class
+class Webcrawler:
+
+   def __init__(self, site_name, description=""):
+    self.site_name = site_name
+    self.description = description
+
+   def setBaseURL(self,baseurl):
+       self.baseurl = baseurl
+
+   def setStartDate(self,start_date):
+       self.start_date = start_date
+
+   def setEndDate(self,end_date):
+       self.end_date = end_date
+
+####################################
+#--      FUNCTOI DEFINITIONS       --#
+####################################
 
 #-- Initialize selenium chrome driver
 def initialize_driver(chromeDriverPath = r'C:/Users/Mohamed Ibrahim/Box Sync/bot/multiscraper/03_utils/chromedriver.exe'):
@@ -33,7 +54,7 @@ def get_content(driver,url):
 driver = initialize_driver()
 
 #-- Initialize crawler class
-c24 = webcrawler.Webcrawler("check24")
+c24 = Webcrawler("check24")
 c24.setBaseURL("https://urlaub.check24.de/")
 
 

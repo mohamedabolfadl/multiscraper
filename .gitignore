@@ -1,0 +1,5 @@
+02_data/
+03_utils/
+*.csv
+*.txt
+.spyproject/
