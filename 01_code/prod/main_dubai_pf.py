@@ -6,9 +6,7 @@ Purpose
     Input:
         NA
     Output:
-        Apartment prices
-        Model to predict price
-
+        price | area | bedrooms | bathrooms | link | price_per_m csv for each neighbourhood
 """
 
 #-- Clear variables
@@ -38,7 +36,7 @@ from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
-
+import statistics as st
 
 
 ####################################
@@ -130,6 +128,10 @@ area_links = {
 "palm_jumeirah":
 "en/search?c=2&l=86&ob=nd&page=1&rp=y&t=1"}
 
+
+    
+    
+    
 for district in area_links.keys():
 
     if district != "downtown":
@@ -203,10 +205,16 @@ for district in area_links.keys():
         df_sel.to_csv('02_data/output/basic_offers_'+str(district)+'.csv')
 
 
-
+######################################################################################################################
 
 
 if False:
+
+    #-- Median price per neighbourhood    
+    for district in area_links.keys():
+        df_sel = pd.read_csv('02_data/output/basic_offers_'+str(district)+'.csv')
+        df_sel = df_sel[df_sel.bedrooms == 2]
+        print(district+" "+str(round(st.median(df_sel['prc_per_m']))))
 
     
     df_sel = pd.read_csv('02_data/output/basic_offers_jbr.csv')
@@ -220,3 +228,17 @@ if False:
 
 
 
+import webbrowser
+
+
+for district in area_links.keys():
+
+    df_sel = pd.read_csv('02_data/output/basic_offers_'+str(district)+'.csv')
+    df_sel = df_sel[(df_sel['price']<100000) & (df_sel['bedrooms']>1)]
+
+    for k in range(3):
+        print(k)
+        if k<1:
+            webbrowser.open_new(df_sel.iloc[k,5])
+        else:
+            webbrowser.open_new_tab(df_sel.iloc[k,5])
