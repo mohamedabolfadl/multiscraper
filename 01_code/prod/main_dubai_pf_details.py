@@ -4,7 +4,7 @@ Purpose
     Input:
         basic_offers_xxx.csv
     Output:
-
+        detailed_offers_xxx.csv with amenities, furnishment, desc text, etc
 """
 
 #-- Clear variables
