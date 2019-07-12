@@ -52,7 +52,7 @@ preProcValues <- preProcess(dt[,..preds], method = c("center", "scale"))
 dt_preds <- predict(preProcValues, dt[,..preds])
 
 dt <- cbind(dt_preds,dt[,.(target)])
-
+fwrite(dt,paste0("02_data/intermediate/ml_clean_",district,".csv"))
 
 tsk = makeRegrTask(data=dt,target="target")
 cv = makeResampleDesc(method="CV",iters = 5)

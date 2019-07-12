@@ -43,6 +43,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn import  tree, linear_model
 from sklearn.model_selection import cross_val_predict, cross_validate,train_test_split, KFold
 from sklearn.metrics import explained_variance_score
+from sklearn.preprocessing import StandardScaler
 
 
 
@@ -97,12 +98,22 @@ for district in districts:
     
     y = df.price
     X = df[predictors]
-
+    ss = StandardScaler()
+    X= ss.fit_transform(X)
 
     if DO_HYPERPARAM_SEARCH:
         # build a regressor
         if USE_XGB_MODEL: 
-            regr = xgboost.XGBRegressor(objective = 'reg:squarederror')
+            #regr = xgboost.XGBRegressor(objective = 'reg:squarederror')
+            regr = xgboost.XGBRegressor(objective ="reg:linear"
+                     ,eta=0.10
+                     ,gamma=0
+                     ,max_depth=4
+                     ,min_child_weight=1
+                     ,subsample=0.8
+                     ,colsample_bytree=0.4
+                     ,nrounds=500)
+            
         else:
             regr = RandomForestRegressor()
         
@@ -120,15 +131,14 @@ for district in districts:
         
 
         if USE_XGB_MODEL: 
-            param_dist =  {  
-                            "n_estimators": sp_randint(50, 200),
-                            "max_depth": sp_randint(2,5),
-                            "learning_rate": st.uniform(0.05, 0.3),
-                            "colsample_bytree": st.beta(5, 10)  ,
-                            "subsample": st.beta(0.08, 0.099)
-#                            "gamma": st.uniform(0, 10),
- #                           'reg_alpha': st.expon(0, 50),
-  #                          "min_child_weight": st.expon(0, 50)
+            param_dist =  {  "objective" : "reg:linear"
+                     ,"eta":0.10
+                     ,"gamma":0
+                     ,"max_depth":4
+                     ,"min_child_weight":1
+                     ,"subsample":0.8
+                     ,"colsample_bytree":0.4
+                     ,"nrounds":500
                         }
         else:
             
@@ -173,12 +183,19 @@ for district in districts:
         if USE_XGB_CV:
             data_dmatrix = xgboost.DMatrix(data=X,label=y)
         
-            params = {"objective":"reg:linear",'colsample_bytree': 0.9,'learning_rate': 0.05,
-                        'max_depth': 3, 'nrounds':1000}
+            params = { "objective" : "reg:linear"
+                     ,"eta":0.10
+                     ,"gamma":0
+                     ,"max_depth":4
+                     ,"min_child_weight":1
+                     ,"subsample":0.8
+                     ,"colsample_bytree":0.8
+                     ,"nrounds":500}
         
             cv_results = xgboost.cv(dtrain=data_dmatrix, params=params, nfold=5,
-                            num_boost_round=1000,early_stopping_rounds=50,metrics="rmse",
-                            as_pandas=True, seed=123)
+                            num_boost_round=500,early_stopping_rounds=20,metrics="rmse",
+                            as_pandas=True,                  
+                            stratified = True)
         
             print((cv_results["test-rmse-mean"]).tail(1))
         
