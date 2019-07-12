@@ -225,18 +225,18 @@ dt.setBaseURL("https://www.propertyfinder.ae/")
 
 #-- Links to areas
 area_links = {
-"downtown":
-"en/search?c=2&l=41&ob=nd&page=1&rp=y&t=1",
-"difc":
-"en/search?c=2&l=39&ob=nd&page=1&rp=y&t=1",
+#"downtown":
+#"en/search?c=2&l=41&ob=nd&page=1&rp=y&t=1",
+#"difc":
+#"en/search?c=2&l=39&ob=nd&page=1&rp=y&t=1",
+# "business_bay":
+#"en/search?c=2&l=36&ob=nd&page=1&rp=y&t=1",
+#"marina":
+#"en/search?c=2&l=50&ob=nd&page=1&rp=y&t=1",
  "sheikh_zayed":
 "en/search?c=2&l=88&ob=nd&page=1&rp=y&t=1",
 "jbr":
 "en/search?c=2&l=67&ob=nd&page=1&rp=y&t=1",
- "business_bay":
-"en/search?c=2&l=36&ob=nd&page=1&rp=y&t=1",
-"marina":
-"en/search?c=2&l=50&ob=nd&page=1&rp=y&t=1",
  "jlt":
 "en/search?c=2&l=71&ob=nd&page=1&rp=y&t=1",
 "palm_jumeirah":

@@ -1,0 +1,1178 @@
+###########################################################################################
+#
+# Author: Mohamed Ibrahim (mohamed_ibrahim@mckinsey.com)
+# Last modified: 28.3.2019
+#
+# Script name: 
+# P4_model_xsell_fixed_wf_hist.R
+#
+# Purpose:
+# Provide score for selling fixed to mobile only customers
+# 
+#
+# Input:
+# 1. 01_data/output/dm_full_temporal.csv
+# 2. 01_data/input/model_params_xsell_fixed.csv
+# 
+# Output:
+# 
+# 
+#
+# Notes:
+# This script can run in one of 2 modes:
+# 1.  Rerun hyperparameter tuning by doing walk forward validation. WARNING This will take  
+#     long time to run (up to 10 hours) [RETUNE_MODEL = T] 
+# 2. Use the latest run of hyperparameter tuning to retrain on the latest months and
+#    score the customers. [RETUNE_MODEL = F]
+#
+# Issues:
+# [No known issues]
+#
+#
+###########################################################################################
+
+
+rm(list=ls())
+
+
+
+
+set.seed(456)
+
+
+#############################################
+#--         1.  LOAD LIBRARIES         --####
+#############################################
+
+library(RJDBC)
+library(data.table)
+library(stringi)
+library(crayon)
+library(xgboost)
+library(mlr)
+library(gains)
+library(caret)
+library(rlist)
+
+
+#############################################
+#--       2.  INPUT PARAMETERS         --####
+#############################################
+#-- Are we running on local machine or server
+RUN_ON_LAPTOP <- grepl("Windows",Sys.info()[1],ignore.case = T)
+#-- Define input jar file
+if(RUN_ON_LAPTOP)
+{
+  #-- Windows jar
+  jar_file <- "09_utils/ojdbc8.jar"
+}else{
+  #-- Linux jar
+  jar_file <- "09_utils/ojdbc6.jar"
+}
+data_output_dir = "01_data/output/"
+data_input_dir = "01_data/input/"
+data_intermediate_dir = "01_data/intermediate/"
+#-- Username on the DB
+db_username <- "ibrahim1moh708"
+#-- PW on the DB
+db_pw       <- "yaQWsx_1234"
+#-- SID of the DB
+db_sid      <- "cldbpr"
+#-- Configurations according to where we are running
+if(RUN_ON_LAPTOP)
+{  
+  db_host     <- "localhost" 
+  db_port     <-  "11521"
+}else{
+  db_host     <- "172.28.164.135" 
+  db_port     <-  "1526"
+}
+#-- Use 8G of RAM for DB connections
+options(java.parameters = "-Xmx8g")
+#-- [IMPORTANT] Flag to redo hyperparameter search. If F then the latest best parameters are used
+RETUNE_MODEL = F
+#-- We target Fixed Only customers so we dont have mobile variables
+USE_MOBILE_VAIRABLES <- F
+#-- We should use fixed variables to predict mobile cross sell
+USE_FIXED_VAIRABLES <- T
+#-- Target is FO
+USE_FMC_VARIABLES <- F
+#-- Flag whether to rerun FMC profiling or just load csv, it takes ~ 5 min to do FMC profiling for 24 months
+DO_FMC_PROFILING <- T
+#-- If a FO customer cross sells, then this flag would exclude any future xsells/churn of this customer
+FILTER_AFER_FIRST_EVENT<-  F
+#-- Directory to save the models
+model_xsell_fix_dir = "07_models/xsell_fix/"
+#-- Directory to save the leads generated
+leads_dir = "08_leads/xsell_fix/"
+#-- Column name of the target to be predicted can be xx_bill, xx_prod, xx_comb
+TARGET_NAME <- "target_xsell_fixed_comb"
+#-- Name of the score columns
+SCORE_NAME <- "score_xsell_fixed"
+#-- Name of the table with the scores
+SCORE_TABLE_NAME <- "leads_xsell_fixed"
+#-- Should we get FMC profiling for FO customers
+DO_FO_PROFILING <- F
+#-- Should we get FMC profiling for MO customers
+DO_MO_PROFILING <- T
+#-- Flag to use csv
+USE_CSV <- T
+
+#############################################
+#--      3.  FUNCTION DEFINITIONS      --####
+#############################################
+
+source("02_code/production/Px_global_functions.R")
+
+
+#############################################
+#--          3.  FMC PROFILING         --####
+#############################################
+cat(blue("[ "+Sys.time()+" ] ")+cyan("#####################################################################\n\n"))
+cat(blue("[ "+Sys.time()+" ] ")+cyan("STARTING THE XSELL FIXED SCRIPT \n\n"))
+cat(blue("[ "+Sys.time()+" ] ")+cyan("#####################################################################\n\n"))
+
+
+if(DO_FMC_PROFILING)
+{
+  source("02_code/production/P4_fmc_profiling.R")
+  
+}else{
+  # Load already profiled customers
+  mo_prof_res<-fread(paste0(data_intermediate_dir,"dm_mo_fmc_profiling.csv"))
+}
+
+
+
+
+#############################################
+#--          3.  READ THE DATAMARTS    --####
+#############################################
+cat(green("Reading the datamarts...\n"))
+
+#-- Read the datamart from RDS if available
+if(!USE_CSV)
+{ 
+  dm_full<-readRDS(paste0(data_output_dir,"dm_full_temporal.RDS"))
+}else{
+  dm_full<-fread(paste0(data_output_dir,"dm_full_temporal.csv"))
+}
+#-- Read the target data mart from RDS if available
+if(!USE_CSV)
+{ 
+  dm_target<-readRDS(paste0(data_output_dir,"dm_target_mart.RDS"))
+}else{
+  dm_target<-fread(paste0(data_output_dir,"dm_target_mart.csv"))
+}
+
+
+setnames(dm_target,TARGET_NAME,"target")
+
+#############################################
+#--          3.  CHECK COLUMNS         --####
+#############################################
+cat(green("Checking that columns are as expected...\n"))
+
+
+#-- Double check that dealercodes and opten industry are chars
+dealer_codes <- names(dm_full)[grepl("dealer",names(dm_full))]
+postcode_nms <- names(dm_full)[grepl("postcode",names(dm_full))]
+industry_nm <- names(dm_full)[grepl("industry_code",names(dm_full))]
+nms_to_char <- unlist(dealer_codes,postcode_nms,industry_nm)
+
+
+#-- For columns whic are encoded with "T"/"F" -> 1/0
+cols <- c("infra_dsl_avail","infra_optical_avail","infra_ed2_avail","infra_ed3_avail")
+for (nm in cols)
+{
+  dm_full[get(nm)=="T",infra:=1][get(nm)=="F",infra:=0]
+  setnames(dm_full,"infra",paste0(nm,"_val"))
+  dm_full[,(nm):=NULL]
+}
+
+
+#-- Exclude rows with no mt_id
+dm_full<-dm_full[!is.na(vevo_mt_id) & !is.na(period)]
+
+
+# TODO: Remove this part
+#-- Renaming some columns to help in feature engineering
+if("max_bandwidth_mb" %in% names(dm_full))
+{
+  setnames(dm_full,"max_bandwidth_mb","fix_max_bandwidth_mb")
+}
+if("mob_data_consumption_mb" %in% names(dm_full))
+{
+  setnames(dm_full,"mob_data_consumption_mb","mobile_data_consumption_mb")
+}
+if("mob_stick_data_consumption_mb" %in% names(dm_full))
+{
+  setnames(dm_full,"mob_stick_data_consumption_mb","mobile_stick_data_consumption_mb")
+}
+
+
+
+
+#-- Attach period ID
+time_lut <-data.table(period=unique(dm_full$period))
+time_lut<-time_lut[order(period)]
+time_lut[,per_id:=seq(1,nrow(time_lut))]
+dm_full<-merge(dm_full,time_lut,all.x = T,by="period")
+
+
+################################################################
+#--           FILTER INSCOPE CUSTOMERS: MO                   --#
+################################################################
+
+cat(blue("[ "+Sys.time()+" ] ")+green("Filtering inscope and attaching target...\n"))
+
+gc()
+
+#-- Only MO customers
+dm_full<-dm_full[vevo_type_comb %in% c("MO","MOC")]
+
+
+gc()
+
+#-- Join the target dm to the features dm
+dm_full <- merge(dm_full,dm_target[,.(period,vevo_mt_id,target)],all.x=T,by=c("period","vevo_mt_id"))
+
+#-- Fill target NAs with 0
+dm_full[is.na(target),target:=0]
+
+#-- Select only the months with labels
+relevant_months <- dm_full[,.N,by=.(target,period)][order(period)][target>0][,period]
+
+#-- Create a subset dataset which only contains labels
+dm_subset <- data.table::copy(dm_full[period %in% relevant_months])
+
+#-- Filter out the occurence after the first target even
+target_date<-dm_subset[target>0,.(target_period=min(period)),by="vevo_mt_id"]
+dm_subset<-merge(dm_subset,target_date,all.x=T,by="vevo_mt_id")
+dm_subset<-dm_subset[period<=target_period | is.na(target_period)]
+
+# Filter out the occurence after the first target event
+if(FILTER_AFER_FIRST_EVENT)
+{
+  target_date<-dm_full[target>0,.(target_period=min(period)),by="vevo_mt_id"]
+  dm_full<-merge(dm_full,target_date,all.x=T,by="vevo_mt_id")
+  dm_full<-dm_full[period<=target_period | is.na(target_period)]
+}
+
+
+#-- Now dm_full contanins all the periods, including the latest period which need to be scored,
+#   whereas dm_subset contains only the training months which have labels
+
+
+#############################################
+#--         VARIABLE PREPROCESSING     --####
+#############################################
+
+cat(blue("\n######################################\n\n"))
+cat(blue("[ "+Sys.time()+" ] ")+green("VARIABLE PREPROCESSING...\n\n"))
+cat(blue("######################################\n\n"))
+
+
+
+cat(blue("[ "+Sys.time()+" ] ")+green("Get variable types...\n"))
+dt_vars<-data.table(col_name=names(dm_subset),type=sapply(dm_subset,class))
+dt_vars[grepl("(mobile|tmh|ict|frame|hwloy|fr_contract|tenure)",col_name,ignore.case = T),MOBILE:=T][is.na(MOBILE),MOBILE:=F]
+dt_vars[grepl("(fix|oss|amd|toh)",col_name,ignore.case = T),FIX:=T][is.na(FIX),FIX:=F]
+
+
+#--------------------------------------------------------------#
+#--          .Character feature dummify top occurence     --####
+#--------------------------------------------------------------#
+cat(blue("[ "+Sys.time()+" ] ")+green("Dummifying char characters...\n"))
+
+
+#-- Initialize character variable vector
+char_vars<-c()
+
+#-- Exclusion variables
+if(USE_FIXED_VAIRABLES)
+{
+  char_vars <- c(char_vars,dt_vars[type %in% "character" & MOBILE==F & !grepl("(vevo_mt_id|period|vevo_type_comb|vevo_segment|VEVO_TYPE|future|timestamp)",col_name,ignore.case =T),col_name])
+  
+}
+
+if(USE_MOBILE_VAIRABLES)
+{
+  char_vars <- c(char_vars,dt_vars[type %in% "character" & FIX==F & !grepl("(vevo_mt_id|period|vevo_type_comb|vevo_segment|VEVO_TYPE|future|timestamp)",col_name,ignore.case =T),col_name])
+  
+}
+
+#-- Transform some character variables for dumiification
+dm_subset[,postcode_first:=stri_sub(postcode,1,1)][,postcode_district:=stri_sub(postcode,2,3)]
+dm_full[,postcode_first:=stri_sub(postcode,1,1)][,postcode_district:=stri_sub(postcode,2,3)]
+
+#-- Exclude the variables which do not need to be dummified
+vars_to_dummyfiy <- setdiff(char_vars,c("opten_foundation_date","opten_email","opten_fullname","vevo_nm","opten_owners"))
+
+#-- Include the transformed variables
+vars_to_dummyfiy <- c(vars_to_dummyfiy,"postcode_first","postcode_district")
+
+
+
+
+j <-1
+per_ids <- sort(unique(dm_full$per_id))
+
+#-- Looping over the periods and creating dummified features per period
+for(per in per_ids)
+{
+  
+  
+  #-- Get the dumified datatable
+  dt_res_curr <- get_dummified_dt(dm_full[per_id %in% per],N_max_all=3, vars_to_dummyfiy=vars_to_dummyfiy, key_column = "vevo_mt_id")
+  dt_res_curr[,per_id:=per]
+  
+  
+  if(j==1)
+  {
+    dt_res_dumm <- dt_res_curr  
+  }else{
+    dt_res_dumm <- rbind(dt_res_dumm,dt_res_curr,fill=T)
+  }
+  
+  j<-j+1
+}
+
+
+
+#-- Join the dummified data
+dm_full<-merge(dm_full,dt_res_dumm,all.x=T,by=c("vevo_mt_id","per_id"))
+dm_subset<-merge(dm_subset,dt_res_dumm,all.x=T,by=c("vevo_mt_id","per_id"))
+
+#-- Delete character variables
+cols<-setdiff(names(dm_subset),vars_to_dummyfiy)
+dm_subset<-dm_subset[,..cols]
+
+#-- Delete character variables
+cols<-setdiff(names(dm_full),vars_to_dummyfiy)
+dm_full<-dm_full[,..cols]
+
+
+
+gc()
+
+
+#--------------------------------------------------------------#
+#--          Getting company age and label has opten_email   --#
+#--------------------------------------------------------------#
+cat(blue("[ "+Sys.time()+" ] ")+green("Getting company age...\n"))
+
+
+dm_subset[,current_period:=paste0(substr(period,1,4),"-",substr(period,5,6),"-","28")][grepl("^\\d\\d\\d\\d\\-\\d\\d\\-\\d\\d",opten_foundation_date),opten_foundation_date_mod:=as.Date(opten_foundation_date)][!is.na(opten_foundation_date_mod),company_age:=as.numeric(difftime(current_period,opten_foundation_date_mod,units="days"))][,opten_foundation_date_mod:=NULL]
+dm_full[,current_period:=paste0(substr(period,1,4),"-",substr(period,5,6),"-","28")][grepl("^\\d\\d\\d\\d\\-\\d\\d\\-\\d\\d",opten_foundation_date),opten_foundation_date_mod:=as.Date(opten_foundation_date)][!is.na(opten_foundation_date_mod),company_age:=as.numeric(difftime(current_period,opten_foundation_date_mod,units="days"))][,opten_foundation_date_mod:=NULL]
+
+
+cat(blue("[ "+Sys.time()+" ] ")+green("Labeling opten has email flag...\n"))
+dm_subset[!is.na(opten_email) & opten_email!="",has_opten_email:=T][is.na(has_opten_email),has_opten_email:=F]
+dm_full[!is.na(opten_email) & opten_email!="",has_opten_email:=T][is.na(has_opten_email),has_opten_email:=F]
+
+
+
+
+
+#############################################
+#--          FEATURE ENGINEERING       --####
+#############################################
+
+cat(blue("\n######################################\n\n"))
+cat(blue("[ "+Sys.time()+" ] ")+green("FEATURE ENGINEERING...\n\n"))
+cat(blue("######################################\n\n"))
+
+
+#-- Join the fmc profile scores
+dm_subset <- merge(dm_subset,mo_prof_res,all.x=T,by.x=c("per_id","vevo_mt_id"),by.y=c("period","vevo_mt_id"))
+dm_full <- merge(dm_full,mo_prof_res,all.x=T,by.x=c("per_id","vevo_mt_id"),by.y=c("period","vevo_mt_id"))
+
+
+#--------------------------#
+#       dm_subset          #
+#--------------------------#
+
+#-- Doing the feature engineering for dm_subset
+dm<-data.table::copy(dm_subset)
+#-- Get the column types for choosing Mobile/Fixed etc
+dt_vars<-get_col_types(dm)
+#-- Get mobile cols
+# 27 Feb make sure that we are selecting only logical and numerics
+mob_cols <- dt_vars[predictors==T & historized==T & FIX==F & type%in%c("numeric","logical","integer"),col_name]
+mob_cols<-unlist(c(mob_cols,"vevo_mt_id","period","target"))
+#-- Extracting mobile cols
+dm<-dm[,..mob_cols]
+
+#-- Perform feature engineering in a separate script
+cat(blue("[ "+Sys.time()+" ] ")+green("Calling the script P4_feature_engineering_mobile_variables.R...\n"))
+source("02_code/production/P4_feature_engineering_mobile_variables.R")
+cat(blue("[ "+Sys.time()+" ] ")+green("Done\n"))
+
+#-- Get a backup to use for training later on
+dm_bup <- data.table::copy(dm)
+
+
+#--------------------------#
+#       dm_full            #
+#--------------------------#
+
+#-- Doing the feature engineering for dm_full
+dm<-data.table::copy(dm_full)
+#-- Get the column types for choosing Mobile/Fixed etc
+dt_vars<-get_col_types(dm)
+#-- Get mobile cols
+# 27 Feb make sure that we are selecting only logical and numerics
+mob_cols <- dt_vars[predictors==T & historized==T & FIX==F & type%in%c("numeric","logical","integer"),col_name]
+mob_cols<-unlist(c(mob_cols,"vevo_mt_id","period","target"))
+
+#-- Extracting mobile cols
+dm<-dm[,..mob_cols]
+
+
+#-- Perform feature engineering in a separate script
+cat(blue("[ "+Sys.time()+" ] ")+green("Calling the script P4_feature_engineering_mobile_variables.R...\n"))
+source("02_code/production/P4_feature_engineering_mobile_variables.R")
+cat(blue("[ "+Sys.time()+" ] ")+green("Done\n"))
+
+
+dm_full_prd_rdy <- data.table::copy(dm)
+
+dm <- data.table::copy(dm_bup)
+
+
+#-- Clean up
+rm(dm_bup)
+rm(dm_full)
+rm(dm_target)
+rm(mo_prof_res)
+rm(dm_subset)
+rm(dt_res_curr)
+rm(target_date)
+rm(time_lut)
+gc()
+
+
+
+
+
+
+#############################################
+#--             MODEL TRAINING         --####
+#############################################
+
+cat(blue("\n######################################\n\n"))
+cat(blue("[ "+Sys.time()+" ] ")+green("MODEL TRAINING\n\n"))
+cat(blue("######################################\n\n"))
+
+
+
+
+#-- Preprocess a dataframe
+# Returns a list of two preprocessed data.tables
+# One has the same number of features
+# Second with less features if correlated features are to be removed/ PCA components to be extracted
+
+preprop<-function(dt_input,pcaComp=20,doPCA=F,center_and_scale=F,doZeroVar=F,filterCorr = T,corrThresh=0.95)
+{
+  
+  require(caret)
+  require(data.table)
+  
+  #-- Convert to data.frame since it only works on dataframes
+  dt_input<-as.data.frame(dt_input)
+  
+  #-- Impute NAs with median  
+  medianimputer = preProcess(dt_input, method = "medianImpute")
+  dt_input <- predict(medianimputer, dt_input)
+  
+  #-- Center and scale variables  
+  if(center_and_scale)
+  {
+    preProcValues <- preProcess(dt_input, method = c("center", "scale"))
+    dt_input <- predict(preProcValues, dt_input)
+  }
+  
+  #-- Exclude variables with zero variance
+  if(doZeroVar)
+  {
+    zeroVar = preProcess(dt_input, method = "zv")
+    dt_input <- predict(zeroVar, dt_input)
+  }
+  
+  #-- Filter out highly correlated features
+  if(filterCorr)
+  {
+    res_corr<-cor(dt_input)
+    res<-caret::findCorrelation(res_corr,cutoff = corrThresh)
+    dt_input_filt <- as.data.table(dt_input[,-res])
+  }
+  
+  #-- Extract the PCA components
+  if(doPCA)
+  {
+    #-- We must do zero variance before PCA
+    zeroVar = preProcess(dt_input, method = "zv")
+    dt_input_pca <- predict(zeroVar, dt_input)
+    
+    #-- Run pca transform        
+    pca_transform <- preProcess(dt_input_pca, method = c("pca"),pcaComp =pcaComp)
+    trainTransformed_pca <- predict(pca_transform, dt_input_pca)
+    
+    #-- Return list with 2 dataframe results
+    return(list(as.data.table(dt_input),as.data.table(trainTransformed_pca)))
+    
+  }else{
+    
+    if(filterCorr)
+    {     
+      return(list(as.data.table(dt_input),as.data.table(dt_input_filt)))
+      
+    } else{
+      return(list(as.data.table(dt_input)))
+    }
+  }  
+}
+
+get_feat_imp<-function(mdl, cnt)
+{
+  feat_importance <- as.data.table(xgb.importance(model=mdl))
+  feat_importance[,Gain:=Gain/feat_importance[1,Gain]]
+  return(feat_importance[1:10])
+}
+
+
+#-- Function to train the model historically using certain parameters and return the historic model performance
+train_historically<-function(training, params, dm_full)
+{
+  if( (min(training$per_id)+ params$PREDICTION_LOOK_AHEAD) > max(training$per_id)  )
+  {
+    
+    cat(blue("[ "+Sys.time()+" ] ")+red("[ERROR] the available datamart is smaller than the period needed for the model...\n"))
+    cat(blue("[ "+Sys.time()+" ] ")+red("[ERROR] Available periods = "+paste0(unique(training$per_id),collapse = ",")+"...\n"))
+    cat(blue("[ "+Sys.time()+" ] ")+red("[ERROR] PREDICTION_LOOK_AHEAD = "+params$PREDICTION_LOOK_AHEAD+"...\n"))
+    stop("Exiting..")
+    
+    
+  }
+  
+  #-- Groups for calculating gains
+  GAINS_GROUP = 10
+  
+  #-- Reading the input parameters
+  # Number of months to look back for training 0 means only train on the current month, 1 means current month and previous month and so on
+  N_max_lookback<- params$N_max_lookback
+  
+  #-- Once the model is trained for the current month, how many months in future should the month predict. This depends on the target variable definition
+  PREDICTION_LOOK_AHEAD<-params$PREDICTION_LOOK_AHEAD
+  
+  #-- Should we train on all features including the highly correlated ones?
+  DO_ALL_FEATS <- params$DO_ALL_FEATS
+  
+  #-- Get the smallest period id
+  min_per_w_target <- min(training$per_id)
+  
+  #-- Initializing the periods for loopinf from the first period of to the last - prediction look ahead
+  pre_vec <- sort(unique(dm$per_id))
+  pre_vec <- sort(unique(training$per_id))[1:(length(pre_vec)-PREDICTION_LOOK_AHEAD)]
+  
+  #-- Initialize gain vecots
+  #-- Single model with all features
+  gn <-c()
+  #-- Single model with filtered out correlated features
+  gn_corr <- c()
+  #-- Multiple models with GLM
+  gn_corr_stck <- c()
+  
+  #-- Make a learner based on the input hyperparameters
+  lrn = makeLearner(cl="classif.xgboost",predict.type="prob")
+  lrn = setHyperPars(lrn, eta = params$eta, max_depth =params$max_depth,nrounds = params$nrounds, colsample_bytree=params$colsample_bytree,
+                     subsample=params$subsample,min_child_weight =params$min_child_weight)
+  
+  
+  #-- Since we have a highly imbalanced dataset, this part decides upon how to rebalance the model using the following heirarchy
+  # Weighted class: gives higher weight to less occuring class
+  # overbagging: creates bagged learners specific for less occuring class
+  # smote: Oversampling and undersampling at the same time
+  # class_sampling: either oversample the less occuring class or under sample the more occuring class
+  
+  if(abs(params$weightedclass)>0)
+  {
+    lrn = makeWeightedClassesWrapper(lrn, wcw.weight = 1/abs(params$weightedclass))
+  }else{
+    if(params$overbagging>0)
+    {
+      lrn = makeOverBaggingWrapper(lrn, obw.rate = params$overbagging, obw.iters = 3)
+      
+    }else{
+      
+      if(params$smote>0)
+      {
+        lrn = makeSMOTEWrapper(lrn, sw.rate = params$smote, sw.nn = 5)
+        
+      }else{
+        
+        if(params$class_sampling>0)
+        {
+          lrn  = makeOversampleWrapper(lrn, osw.rate = params$class_sampling)
+          
+        }else{
+          if(params$class_sampling<0)
+          {
+            lrn = makeUndersampleWrapper(lrn, usw.rate = 1/ abs(params$class_sampling))
+          }
+          
+        } 
+        
+      }
+      
+    }
+  }
+  
+  
+  #-- Initialize feature importance
+  feat_imp_lst = list()
+  
+  #-- Initialize the period counter
+  i<-1
+  
+  for (j in pre_vec)
+  {
+    
+    cat(blue("[ "+Sys.time()+" ] ")+green(" Period: "+j+"...\n"))
+    
+    #-- Get training and test period ids
+    train_per_id <- seq( pre_vec[max(1,i - N_max_lookback)] , pre_vec[i] ) 
+    test_per_id <- pre_vec[min(length(pre_vec),i + PREDICTION_LOOK_AHEAD) ]
+    
+    #-------------------------------------#
+    #--    Extract training months   --####
+    #-------------------------------------#
+    
+    #-- Get the training months which are from now to now-N_max_lookback
+    training_cur_mnth <- training [ per_id %in% train_per_id ] 
+    
+    #-- Make sure we have labels to learn from, otherwise we cant fit a model
+    if(nrow(training_cur_mnth[target>0])>10)
+    {
+      
+      #-------------------------------------#
+      #--    Extract test months       --####
+      #-------------------------------------#
+      
+      #-- Getting test sample from current month + look ahead
+      testing_nxt_mnth <- training [ per_id == test_per_id]
+      
+      #-- If we are training on multiple months, then we take the latest snapshot of the customers (this month or previous months)
+      latest_snpsht <-  training_cur_mnth [ , list ( target = max ( as.numeric( target ) , na.rm  = T ) , per_id = max( per_id , na.rm = T ) ) , by = "vevo_mt_id" ]
+      
+      #-- Join variables to target
+      dm_train <- merge ( latest_snpsht , training_cur_mnth , all.x = T , by = c( "vevo_mt_id" , "per_id" , "target" ) )
+      
+      
+      #-------------------------------------#
+      #-- Selecting the predictor columns --#
+      #-------------------------------------#
+      
+      #-- Get the predictors from the columns
+      var_cols <- names(dm_train)[!grepl("(period|target|per_id|vevo)",names(dm_train))]
+      
+      #-- Exclude min, max, mean columns if its in the configurations
+      if(params$EXCLUDE_MIN_MAX==T)
+      {
+        var_cols<-var_cols[!grepl("(min|max|mean)",var_cols)]
+      }
+      
+      #-- Exclude columns which are in the input configurations
+      if(params$excl_str!="")
+      {
+        var_cols<-var_cols[!grepl(params$excl_str,var_cols)]
+      }
+      
+      
+      #-------------------------------------#
+      #-- Preprocessing the predictors    --#
+      #-------------------------------------#
+      
+      #-- Preprocessing features of the training set depending on the input configurations
+      preprop_res<-suppressWarnings(preprop(dm_train[,..var_cols],doPCA=F,doZeroVar = T,filterCorr = T,corrThresh = params$corr_threshold))
+      
+      #-- Preprocessed table with all the features
+      dm_prep<-preprop_res[[1]] 
+      
+      #-- Preprocessed table with correlated features filtered out
+      dm_prep_corr<-preprop_res[[2]]
+      
+      #-- Same for the test set
+      # PS: We cannot exclude correlated features from the test set, since the relevant features are defined in the training set
+      preprop_res_tst<-suppressWarnings(preprop(testing_nxt_mnth[,..var_cols],doPCA=F,filterCorr = F))
+      dm_prep_tst<-preprop_res_tst[[1]]
+      
+      #------------------------------------------------#
+      #--    Define target variable and create tasks --#
+      #------------------------------------------------#
+      
+      #-- Attach target to training
+      if(DO_ALL_FEATS)
+      {  
+        dm_prep[,':='(target=dm_train$target)]
+      }
+      dm_prep_corr[,':='(target=dm_train$target)]
+      
+      #-- Factor the target since we are doing classification
+      if(DO_ALL_FEATS)
+      {
+        dm_prep[,target:=as.factor(target)]
+      }
+      dm_prep_corr[,target:=as.factor(target)]
+      
+      #-- Make mlr tasks
+      if(DO_ALL_FEATS)
+      {
+        tsk = makeClassifTask(data=as.data.frame(dm_prep),target="target")
+      }
+      tsk_corr = makeClassifTask(data=as.data.frame(dm_prep_corr),target="target")
+      
+      
+      #------------------------------------------------#
+      #--       Train the model                   --####
+      #------------------------------------------------#
+      
+      #-- Make sure we have the same seed 
+      set.seed(456)
+      
+      if(DO_ALL_FEATS)
+      {
+        mdl<-mlr::train(lrn,tsk)
+      }
+      mdl_corr<-mlr::train(lrn,tsk_corr)
+      
+      #-- Get feature importance
+      feat_imp <- get_feat_imp(getLearnerModel(mdl_corr, more.unwrap = T), 10)
+      
+      #-- Append to list
+      feat_imp_lst <- list.append(feat_imp_lst,feat_imp)
+      
+      #-----------------------------------------------#
+      #--   Predict on test set using single model  --#
+      #-----------------------------------------------#
+      
+      #-- Extracting the truth from the test set
+      truth <- as.numeric(testing_nxt_mnth$target)
+      
+      #-- Get the features expected by the model
+      if(DO_ALL_FEATS)
+      {
+        exp_cols <- mdl$features
+      }
+      exp_cols_corr <- mdl_corr$features
+      
+      #-- Predict on test set
+      if(DO_ALL_FEATS)
+      {
+        preds <- predict(    getLearnerModel(mdl, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols] ))
+      }
+      preds_corr <- predict(    getLearnerModel(mdl_corr, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr] ))
+      
+      
+      
+      #-----------------------------------------------#
+      #--       Get the gains of single model    --####
+      #-----------------------------------------------#
+      
+      if(DO_ALL_FEATS)
+      {
+        gns_test<-gains(truth,preds,groups = GAINS_GROUP, percents = F)
+      }
+      
+      #-- Single model with corr features filtered out
+      gns_test_corr<-gains(truth,preds_corr,groups = GAINS_GROUP, percents = F)
+      
+      #-- Append the gain of the single model
+      if(DO_ALL_FEATS)
+      {
+        gn <- unlist(c(gn,gns_test$cume.lift[1]-100 ))
+      }
+      
+      
+      
+      #-----------------------------------------------#
+      #--            Stacking model              --####
+      #-----------------------------------------------#
+      # Idea of stacking model is to use the predictions using the very first model we trained, and the model from the past period as well as the current model to
+      # produce a prediction for the test set. The predictions from the three models are combined using a linear model (GLM)
+      
+      
+      #-----------------------------------------------#
+      #--            Get stacking predictions    --####
+      #-----------------------------------------------#
+      
+      #-- We need to have at least 2 previous models to stack with the current model
+      if(i>3)
+      {
+        
+        #-- Get predictions using the first model we trained
+        preds_corr_1 <- predict(    getLearnerModel(mdl_corr_1, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_1] ))
+        
+        #-- Get predictions using the model from the past period
+        preds_corr_f <- predict(    getLearnerModel(mdl_corr_f, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_f] ))
+        
+        #-- Combine the predictions in a table
+        # TODO: Use flags to use the important variables as donw for USE_MODEL_1
+        stack_preds <- data.table(pred=preds_corr,pred_f=params$USE_MODEL_F*preds_corr_f,pred_1=params$USE_MODEL_1*preds_corr_1)
+        stack_preds[is.na(stack_preds)]<-0
+        
+        #-- Use the glm model from the previous run to combine the predictions into one
+        # TODO: Add important variables here [Use those from the code of ]
+        stck_preds<- predict(mdl_glm,newdata=stack_preds,type="response")
+        
+        #-- Get the gains of the stacked model
+        gns_test_corr_stck<-gains(truth,stck_preds,groups = GAINS_GROUP, percents = F)
+        
+        #-- Append performance
+        gn_corr_stck <- unlist(c(gn_corr_stck,gns_test_corr_stck$cume.lift[1]-100 ))
+        gn_corr <- unlist(c(gn_corr,gns_test_corr$cume.lift[1]-100 ))
+        
+        #-- Print out performance
+        cat(yellow(paste0("STACK ",paste0(gn_corr_stck,collapse="_")," roll mean ",mean(gn_corr_stck[!is.nan(gn_corr_stck)],na.rm = T),"\n\n")))
+        cat(red(paste0("NON_CORR ",paste0(gn_corr[!is.na(gn_corr)],collapse="_")," roll mean ",mean(gn_corr[!is.na(gn_corr)],na.rm = T),"\n\n")))
+        
+        #-- Append the lst_gains
+        if(i==4)
+        {
+          #-- Only at the 4th iteration do we have a single performance
+          gains_lst_corr_stck<-list(gns_test_corr_stck)
+        }else{
+          
+          if(i>4)
+          {
+            #-- Append the stacked model performance
+            gains_lst_corr_stck<-list.append(gains_lst_corr_stck,gns_test_corr_stck)
+          }
+          
+        }
+        
+      }
+      
+      
+      #-----------------------------------------------#
+      #--               Train GLM model          --####
+      #-----------------------------------------------#
+      
+      #-- We need at least 2 previous models and a current model to train the GLM
+      if(i>2)
+      {
+        
+        #-- Get the predictions of the previous models, those work as features for the GLM
+        preds_corr_1 <- predict(    getLearnerModel(mdl_corr_1, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_1] ))
+        preds_corr_f <- predict(    getLearnerModel(mdl_corr_f, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_f] ))
+        
+        #-- Combine the predictions in one table
+        stack_train <- data.table(pred=preds_corr,pred_f=params$USE_MODEL_F*preds_corr_f,pred_1=params$USE_MODEL_1*preds_corr_1,truth=truth)
+        stack_train[is.na(stack_train)]<-0
+        
+        #-- Set the target as a factor
+        stack_train[,truth:=as.factor(truth)]
+        
+        #-- Train a GLM for the next iteration
+        mdl_glm<-glm(truth~.,family=binomial,data=stack_train)
+        
+      }
+      
+      #-----------------------------------------------#
+      #--  Save current model for next iteration    --#
+      #-----------------------------------------------#
+      
+      mdl_corr_1 = mdl_corr
+      exp_cols_corr_1 = exp_cols_corr
+      
+      
+      
+      #-----------------------------------------------#
+      #--      Create a list of gains table      --####
+      #-----------------------------------------------#
+      
+      #-- Create a list of gains table
+      if(i==1)
+      {
+        if(DO_ALL_FEATS)
+        {
+          gains_lst_all<-list(gns_test)
+        }
+        gains_lst_corr<-list(gns_test_corr)
+        
+        #-- Save first model
+        mdl_corr_f = mdl_corr
+        exp_cols_corr_f = exp_cols_corr
+        
+      }else{
+        if(DO_ALL_FEATS)
+        {
+          gains_lst_all<-list.append(gains_lst_all,gns_test)
+        }
+        gains_lst_corr<-list.append(gains_lst_corr,gns_test_corr)
+      }
+      
+      
+      
+      #-- Print out performance of the single model using all features
+      if(DO_ALL_FEATS)
+      {
+        cat(yellow(paste0("ALL_FEAT ",paste0(gn,collapse="_")," roll mean ",mean(gn[!is.nan(gn)],na.rm = T),"\n\n")))
+      }
+      
+      
+    }
+    
+    #-- Increment to next period
+    i<-i+1
+    
+  }
+  
+  
+  
+  #-------------------------------------------------------#
+  #--  SCORE CUSTOMER BASE USING THIS HYPERPARAMTER  --####
+  #-------------------------------------------------------#
+  
+  
+  
+  #-- Getting test sample from current month + look ahead
+  latest_period <- max(dm_full$per_id)
+  testing_nxt_mnth <- dm_full [ per_id == latest_period ]
+  
+  #-- Preprocess the tes set
+  preprop_res_tst<-suppressWarnings(preprop(testing_nxt_mnth[,..var_cols],doPCA=F,filterCorr = F))
+  dm_prep_tst<-preprop_res_tst[[1]]
+  
+  if(DO_ALL_FEATS)
+  {
+    preds <- predict(    getLearnerModel(mdl, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols] ))
+  }
+  
+  preds_corr <- predict(    getLearnerModel(mdl_corr, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr] ))
+  
+  #-- Get predictions using the first model we trained
+  preds_corr_1 <- predict(    getLearnerModel(mdl_corr_1, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_1] ))
+  
+  #-- Get predictions using the model from the past period
+  preds_corr_f <- predict(    getLearnerModel(mdl_corr_f, more.unwrap = T),as.matrix(dm_prep_tst[,..exp_cols_corr_f] ))
+  
+  
+  stack_preds <- data.table(pred=preds_corr,pred_f=params$USE_MODEL_F*preds_corr_f,pred_1=params$USE_MODEL_1*preds_corr_1)
+  stack_preds[is.na(stack_preds)]<-0
+  
+  #-- Use the glm model from the previous run to combine the predictions into one
+  # TODO: Add important variables here [Use those from the code of ]
+  stck_preds<- predict(mdl_glm,newdata=stack_preds,type="response")
+  
+  #-- Attach vevo mt id to the scores
+  current_base_score <- data.table(vevo_mt_id = testing_nxt_mnth$vevo_mt_id, score = stck_preds)
+  
+  #-- Normalize scores
+  min_score <- min(current_base_score$score)
+  max_score <- max(current_base_score$score)
+  
+  current_base_score[,score:= (score-min_score) / (max_score-min_score)]
+  current_base_score<-current_base_score[order(-score)]
+  
+  
+  current_base_score[,timestamp:=Sys.time()]
+  
+  
+  #-----------------------------------------------#
+  #--        Collect resulting list          --####
+  #-----------------------------------------------#
+  
+  if(DO_ALL_FEATS)
+  {
+    gn <- gn[!is.nan(gn)]
+  }
+  if(DO_ALL_FEATS)
+  {
+    dt_res = data.table(sr_gn=mean(gn)/(1+sd(gn)),sr_gn_corr=mean(gn_corr)/(1+sd(gn_corr)),gn_corr=mean(gn_corr),gn=mean(gn))
+    res<-list(dt_res,data.table(gn=gn,gn_corr=gn_corr),gains_lst_all,gains_lst_corr,data.table(),data.table(), current_base_score, feat_imp_lst)
+  }else{
+    dt_res = data.table(sr_gn_corr=mean(gn_corr)/(1+sd(gn_corr)),gn_corr=mean(gn_corr),sr_gn_corr_stck=mean(gn_corr_stck)/(1+sd(gn_corr_stck)),gn_stack=mean(gn_corr_stck))
+    print(dt_res)
+    res<-list(dt_res,data.table(gn=0,gn_corr=gn_corr),data.table(),gains_lst_corr,gn_corr_stck,gains_lst_corr_stck, current_base_score, feat_imp_lst)
+    
+  }
+  
+  return(res)
+}
+
+
+
+
+#############################################
+#--       DEFINE HYPERPARAMETERS       --####
+#############################################
+
+
+if(RETUNE_MODEL)
+{
+  #-- Full grid search, reduce the combinations to have a quicker run
+  params<-expand.grid(eta=c(0.1,0.2),max_depth=c(2,3),nrounds=c(100,200,50),colsample_bytree=c(1,0.8),PREDICTION_LOOK_AHEAD=c(3),
+                      subsample=c(1,0.8),min_child_weight=c(1,10),N_max_lookback=c(0),EXCLUDE_MIN_MAX=c(T),
+                      REMOVE_CORRELATED_FEATS=c(T),REMOVE_ZERO_VAR=c(F),weightedclass=c(0),overbagging=c(0),smote=c(0),class_sampling=c(-2),
+                      excl_str="(dealer)",corr_threshold=c(0.95),DO_ALL_FEATS=c(F),USE_MODEL_1 = c(1), USE_MODEL_F = c(1)) 
+  
+}else{
+  
+  #-- Use previously known optimal parameters
+  bst_params <- fread(data_input_dir+"model_params_xsell_fixed.csv")
+  bst_params <- bst_params[1,]
+  
+  #-- Set the hyperparameters accordingly
+  params<-expand.grid(eta=c( as.numeric(bst_params$eta)  ),max_depth=c(as.integer(bst_params$max_depth) ),
+                      nrounds=c(as.integer(bst_params$nrounds) ),colsample_bytree=c(as.numeric(bst_params$colsample_bytree) ),
+                      PREDICTION_LOOK_AHEAD=c(as.integer(bst_params$PREDICTION_LOOK_AHEAD)),
+                      subsample=c(as.numeric(bst_params$subsample)),min_child_weight=c(as.integer(bst_params$min_child_weight) ),
+                      N_max_lookback=c(as.integer(bst_params$N_max_lookback)),EXCLUDE_MIN_MAX=c( as.logical(bst_params$EXCLUDE_MIN_MAX)),
+                      REMOVE_CORRELATED_FEATS=c(as.logical(bst_params$REMOVE_CORRELATED_FEATS)),REMOVE_ZERO_VAR=c(as.logical(bst_params$REMOVE_ZERO_VAR)),
+                      weightedclass=c(as.numeric(bst_params$weightedclass) ),overbagging=c(as.numeric(bst_params$overbagging)),
+                      smote=c(as.numeric(bst_params$smote)),class_sampling=c(as.numeric(bst_params$class_sampling)),
+                      excl_str=as.character(bst_params$excl_str) ,corr_threshold=c(as.numeric(bst_params$corr_threshold) ),
+                      DO_ALL_FEATS=c(as.logical(bst_params$DO_ALL_FEATS)),USE_MODEL_1 = c(as.integer(bst_params$USE_MODEL_1)),
+                      USE_MODEL_F = c(as.integer(bst_params$USE_MODEL_F)))
+  
+}
+
+
+params<-params[sample(nrow(params),nrow(params)),]
+params$seq_row<-seq(1,nrow(params))
+
+
+
+#-- Loop over different hyperparameters
+j<-1
+
+
+while(j<(nrow(params)+1))
+{
+  
+  cat(blue("[ "+Sys.time()+" ] ")+green("Training hyperparamters : "+j+"/"+nrow(params)+"...\n"))
+  
+  #-- Extract the current hyperparameters
+  hyp_params=params[j,]
+  
+  
+  #-- Call the training function
+  res_gross<-train_historically(dm, hyp_params, dm_full_prd_rdy)
+  
+  #-- Get the performance summary    
+  res<-res_gross[[1]]
+  
+  #-- Get the month by month performance    
+  res_seq <- res_gross[[2]]
+  
+  #-- Current base score
+  current_base_score <- res_gross[[7]]
+  setnames(current_base_score,"score",SCORE_NAME)
+  
+  #-- Label which run are we in
+  res_seq[,run_id:=j] 
+  
+  
+  #-- Append results
+  if(j==1)
+  {
+    res_all<-res
+    seq_run <- res_seq
+    curr_base_score_lst <- list(current_base_score)
+    
+  }else{
+    res_all<-rbind(res_all,res)
+    curr_base_score_lst <- list.append(curr_base_score_lst , current_base_score)
+  }
+  
+  seq_run <- rbind(seq_run,res_seq,fill=T)
+  
+  cat(green("############################################\n"))
+  
+  j<-j+1
+}
+
+
+#-- Append the hyperparamters with their results
+params_res<-as.data.table(cbind(params[1:nrow(res_all),],res_all))
+
+#-- Sort according to gain of the stacked model, since this is usually the best
+params_res <- params_res[order(-gn_stack)]
+
+#-- Get best run_id
+best_run_id <- params_res[1,seq_row]
+
+#-- Save the model hyperparameter results
+fwrite(params_res,paste0(model_xsell_fix_dir,"mdl_sel_",gsub(Sys.time(),pattern=":",replacement="_"),".csv"))
+
+#-- Save the historical scores
+fwrite(seq_run,paste0(model_xsell_fix_dir,"score_seq_",gsub(Sys.time(),pattern=":",replacement="_"),".csv"))
+
+#-- Save the entire result as a RDS if we are running the best model so far
+if(!RETUNE_MODEL)
+{
+  saveRDS(res_gross,data_output_dir+"best_model_performance_xsell_fixed.RDS")
+
+}
+#############################################
+#--   GET THE OPTIMAL HYPERPARAMETERS  --####
+#############################################
+
+#-- Pick up the top parameters and save into a csv
+bst_params_grid_search <- params_res[1,]
+
+#- read the current best performance
+current_bst <- fread(data_input_dir+"model_params_xsell_fixed.csv")
+
+#-- Only overwrite the hyperparameters if they give better performance than the current ones
+if(bst_params_grid_search$gn_stack > current_bst$gn_stack)
+{
+fwrite(bst_params_grid_search,data_input_dir+"model_params_xsell_fixed.csv")
+}
+#############################################
+#-- SAVE SCORE OF CURRENT CUSTOMERS    --####
+#############################################
+
+dt_leads_to_write <- curr_base_score_lst[[best_run_id]]
+
+#-- Make sure that vevo_mt_id and timestamp are chars
+dt_leads_to_write[,vevo_mt_id:=as.character(vevo_mt_id)][,timestamp:=as.character(timestamp)]
+
+
+#-- Dump to csv with a time stamp in the name
+fwrite(dt_leads_to_write,paste0(leads_dir,"leads_xsell_fix_",gsub(Sys.time(),pattern="(:|\\s+|\\-)",replacement="_"),".csv"))
+
+
+#----------------------------------------#
+#       Write to database                #
+#----------------------------------------#
+cat(blue("[ "+Sys.time()+" ] ")+green("Creating a DB connection to write results...\n"))
+
+#-- Try to create a DB connection
+conn <- db_connect(jar_file, db_username, db_pw, db_host, db_port, db_sid)
+
+if(dbExistsTable(conn,toupper(SCORE_TABLE_NAME)))
+{
+  cat(blue("[ "+Sys.time()+" ] ")+green("Appending scores to the table "+SCORE_TABLE_NAME+"...\n"))
+  
+  #-- Write to table
+  dbWriteTable(conn,toupper(SCORE_TABLE_NAME),dt_leads_to_write, overwrite = F, append = T)
+}else{
+  cat(blue("[ "+Sys.time()+" ] ")+yellow("Table "+SCORE_TABLE_NAME+" not found, creating a new table with current scores...\n"))
+  
+  dbWriteTable(conn,toupper(SCORE_TABLE_NAME),dt_leads_to_write)
+  
+}
+cat(blue("[ "+Sys.time()+" ] ")+green("Closing DB connection \n"))
+
+#-- Close databse connection
+dbDisconnect(conn)
+
+
+#############################################
+#--         THE END                    --####
+#############################################
+
+

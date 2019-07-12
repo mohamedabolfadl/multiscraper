@@ -4,3 +4,6 @@
 *.txt
 .spyproject/
 *.log
+*.Rproj
+*.Rhistory
+*.RData

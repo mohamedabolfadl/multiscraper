@@ -39,12 +39,6 @@ pd.set_option('display.max_rows', 10)
 pd.set_option('display.max_columns', 20)
 pd.set_option('display.width', 1000)
 
-def flatten(l):
-    for el in l:
-        if isinstance(el, collections.Iterable) and not isinstance(el, (str, bytes)):
-            yield from flatten(el)
-        else:
-            yield el
 
 #-- Get districts which have detailed files
 def getDetailedDistricts():
@@ -66,7 +60,7 @@ districts = getDetailedDistricts()
 #-- Loop through districts
 for district in districts:
 
-
+    print(district)
     #-- Read the detailed offers
     df = pd.read_csv(proj_dir+"\\02_data\\output\\detailed_offers_"+district+".csv")
 

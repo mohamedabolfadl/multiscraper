@@ -1,0 +1,313 @@
+
+
+
+
+
+
+rm(list=ls())
+
+
+
+library(xgboost)
+library(data.table)
+library(mlr)
+library(caret)
+
+
+lrns = as.data.table(listLearners())
+
+district = "downtown"
+
+#-- Install missing libraries
+if(F)
+  {
+uninstalled_pcks = lrns[installed==F & grepl("reg",type),package]
+lapply(uninstalled_pcks,install.packages)
+}
+
+
+#-- Installed regessors
+lrns = lrns[installed==T & grepl("reg",type),class]
+
+
+dt = fread(paste0("02_data/output/ml_ready_",district,".csv"))
+
+
+
+setnames(dt,"price","target")
+dt$V1 <- NULL
+
+
+preds = setdiff(names(dt),"target")
+#preds = c("area","bedrooms","bathrooms","n_amenities","furnished")
+
+preds_tar = c(preds,"target")
+dt=dt[,..preds_tar]
+
+cols = names(dt)
+dt[,(cols):=lapply(.SD,as.numeric),.SDcols = cols]
+
+
+preProcValues <- preProcess(dt[,..preds], method = c("center", "scale"))
+dt_preds <- predict(preProcValues, dt[,..preds])
+
+dt <- cbind(dt_preds,dt[,.(target)])
+
+
+tsk = makeRegrTask(data=dt,target="target")
+cv = makeResampleDesc(method="CV",iters = 5)
+
+
+res = data.table(lrn = lrns)
+
+res$rsq <- 0
+
+
+lrns = setdiff(lrns,c("regr.bartMachine"))
+
+
+lrns = fread("02_data/output/avail_regr.csv")
+lrns= lrns$regr
+
+#-- No amenities
+# lrns = c(regr.earth         0.718352533
+#          regr.randomForest         0.710594660
+#          regr.kknn         0.695151995
+#          regr.cforest         0.691585522
+#          regr.gbm         0.688366230
+# )
+
+#-- All variables
+# regr.earth 0.7442399
+# regr.randomForest 0.7433453
+# regr.gbm 0.7027960
+# regr.cforest 0.6594871
+# regr.kknn 0.5222089
+
+
+lrns=c("regr.xgboost","regr.earth","regr.randomForest","regr.kknn","regr.cforest","regr.gbm")
+
+
+i=1
+while(i < length(lrns)+1)
+  {
+  
+  cl = lrns[i]
+  
+  print("################################")
+  print(i)
+  print(cl)
+
+  
+lrnr = makeLearner(cl=cl)
+if(lrnr=="regr.xgboost")
+{
+  lrnr = makeLearner(cl=cl
+                     ,objective ="reg:linear"
+                     ,eta=0.10
+                     ,gamma=0
+                     ,max_depth=4
+                     ,min_child_weight=1
+                     ,subsample=0.8
+                     ,colsample_bytree=0.4
+                     ,nrounds=500)
+
+}
+
+    cv_res = resample(learner=lrnr,task=tsk,resampling=cv, measures = list(rsq))
+
+
+res[lrn==cl,rsq:=mean(cv_res$measures.test$rsq)]
+print("################################")
+
+i=i+1
+}
+
+
+#fwrite(res,"02_data/output/regr_perfs.csv")
+
+cl = res[order(-rsq)][1,lrn]
+lrnr = makeLearner(cl=cl)
+if(cl=="regr.xgboost")
+{
+  lrnr = makeLearner(cl=cl
+                     ,objective ="reg:linear"
+                     ,eta=0.10
+                     ,gamma=0
+                     ,max_depth=4
+                     ,min_child_weight=1
+                     ,subsample=0.8
+                     ,colsample_bytree=0.4
+                     ,nrounds=500)
+  
+}
+
+cv_res = resample(learner=lrnr,task=tsk,resampling=cv, measures = list(rsq,mse))
+
+
+
+
+
+preds = as.data.table(cv_res$pred$data)
+
+
+preds[,pred_error:=response-truth]
+
+
+dt_det = fread(paste0("02_data/output/detailed_offers_",district,".csv"))
+
+dt_det$qnt<- cut(dt_det$prc_per_m , breaks=quantile(dt_det$prc_per_m, probs = seq(0, 1, 0.02)),
+                 labels=1:50, include.lowest=TRUE)
+
+
+dt_all = cbind(preds[order(id)],dt_det)
+
+
+dt_all = dt_all[order(-pred_error)]
+
+
+
+
+sel = dt_all[bedrooms>1 & price<105001 & furnishment == "Unfurnished",.(link, price, response, area, prc_per_m, qnt)]
+
+sel[1:15,]
+
+
+
+
+###################################
+#--           XGBOOST           --#
+###################################
+
+params_all = expand.grid(booster = "gbtree",
+                         objective = "reg:linear",
+                         eta=c(0.01,0.1,0.2),
+                         gamma=0,
+                         max_depth=c(2,4,6),
+                         min_child_weight=c(1,2), 
+                         subsample=c(0.6,0.8),
+                         colsample_bytree=c(0.4,0.6,0.8),
+                         nrounds = c(200,500,100,1000))
+
+param_res = as.data.table(params_all)
+
+param_res$perf = 99999999
+
+i = 1
+
+while(i<nrow(params_all)+1)
+  {
+#params <- list(booster = "gbtree",
+#               objective = "reg:linear",
+#               eta=0.15,
+#               gamma=0,
+#               max_depth=2,
+#               min_child_weight=1, 
+#               subsample=0.8,
+#               colsample_bytree=0.8)
+
+#params = list(params_all[i,])
+params = params_all[i,]
+
+
+predictors = setdiff(names(dt),"target")
+xgbcv <- xgb.cv( params = params,
+                 data = as.matrix(dt[,..predictors]), 
+                 label = as.matrix(dt$target),
+                 nrounds = params$nrounds, 
+                 nfold = 5, 
+                 showsd = T, 
+                 stratified = T, 
+                 print_every_n = 1000, 
+                 early.stop.round = 20, 
+                 maximize = F)
+
+bst_perf = min(xgbcv$evaluation_log$test_rmse_mean)
+
+param_res[i,perf:=bst_perf]
+
+i=i+1
+}
+
+# booster  gbtree
+# objective  reg:linear
+# eta  0.10
+# gamma 0
+# max_depth 4
+# min_child_weight 1
+# subsample 0.8
+# colsample_bytree 0.4
+# nrounds 500
+# perf 16785.95
+
+bst_params = param_res[order(perf)][1,]
+
+predictors = setdiff(names(dt),"target")
+xgbcv <- xgb.cv( params = bst_params,
+                 data = as.matrix(dt[,..predictors]), 
+                 label = as.matrix(dt$target),
+                 nrounds = params$nrounds, 
+                 nfold = 5, 
+                 showsd = T, 
+                 stratified = T, 
+                 print_every_n = 1000, 
+                 early_stop_round = 20, 
+                 maximize = F,
+                 prediction=TRUE)
+
+
+
+
+cl = "regr.xgboost"
+lrnr = makeLearner(cl=cl
+                   ,objective =eta$objective
+                   ,eta=bst_params$eta
+                     ,gamma=bst_params$gamma
+                     ,max_depth=bst_params$max_depth
+                     ,min_child_weight=bst_params$min_child_weight
+                     ,subsample=bst_params$subsample
+                     ,colsample_bytree=bst_params$colsample_bytree
+                     ,nrounds=bst_params$nrounds)
+
+cv_res = resample(learner=lrnr,task=tsk,resampling=cv, measures = list(rsq,mse))
+
+
+
+
+
+preds = as.data.table(cv_res$pred$data)
+
+
+preds[,pred_error:=response-truth]
+
+
+dt_det = fread(paste0("02_data/output/detailed_offers_",district,".csv"))
+
+dt_det$qnt<- cut(dt_det$prc_per_m , breaks=quantile(dt_det$prc_per_m, probs = seq(0, 1, 0.02)),
+                 labels=1:50, include.lowest=TRUE)
+
+
+dt_all = cbind(preds[order(id)],dt_det)
+
+
+dt_all = dt_all[order(-pred_error)]
+
+
+
+
+sel = dt_all[bedrooms>1 & price<105001 & furnishment == "Unfurnished",.(link, price, response, area, prc_per_m, qnt)]
+
+sel[1:15,]
+
+
+
+if(F)
+  {
+res = fread("02_data/output/regr_perfs.csv")
+
+
+avail_regr = data.table(regr=res[abs(rsq)>0,lrn])
+fwrite(avail_regr,"02_data/output/avail_regr.csv")
+
+
+}
